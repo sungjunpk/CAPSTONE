@@ -1,0 +1,21 @@
+# 보안 파일 (절대 올라가면 안 됨)
+.env
+
+# 파이썬 관련 (불필요한 컴파일 파일들)
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# 데이터 파일 (용량이 크고 API로 다시 받을 수 있으므로 제외 추천)
+*.csv
+*.xlsx
+*.pkl
+
+# macOS 시스템 파일
+.DS_Store
+
+# IDE 설정 (개인 설정이므로 제외)
+.vscode/
+.idea/
