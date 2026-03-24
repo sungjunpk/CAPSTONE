@@ -9,10 +9,19 @@ import joblib
 import os
 from pathlib import Path
 
-# ============================== [0] 경로 설정 ==============================
+# ============================== [0] 경로 및 장치 설정 ==============================
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "csv"
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+# 장치 설정 (MPS, CUDA, CPU 순서로 자동 감지)
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
+
+print(f"🚀 현재 사용 중인 연산 장치: {DEVICE}")
 
 if not DATA_DIR.exists():
     os.makedirs(DATA_DIR)
@@ -34,7 +43,7 @@ class StockDataset(Dataset):
         feature_df = df.drop(columns=['dt', 'stk_cd'])
         target_idx = feature_df.columns.get_loc('close')
         
-        # 2. 전체 피처 스케일링 (중요: NaN 방지의 핵심)
+        # 2. 전체 피처 스케일링
         self.full_scaler = StandardScaler()
         scaled_data = self.full_scaler.fit_transform(feature_df)
         
@@ -47,7 +56,6 @@ class StockDataset(Dataset):
         
         # 종목별 시퀀스 생성
         for code in df['stk_cd'].unique():
-            # 스케일링된 데이터에서 해당 종목 필터링
             mask = (df['stk_cd'] == code).values
             stock_data = scaled_data[mask]
             
@@ -55,7 +63,6 @@ class StockDataset(Dataset):
             
             for i in range(len(stock_data) - seq_len - max_h + 1):
                 self.X.append(stock_data[i : i + seq_len])
-                # 미래 시점 종가 (이미 스케일링된 값 사용)
                 targets = [stock_data[i + seq_len + h - 1, target_idx] for h in pred_horizon]
                 self.y.append(targets)
         
@@ -74,7 +81,6 @@ class StockTransformer(nn.Module):
         self.input_proj = nn.Linear(feature_dim, 128)
         self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, 128) * 0.01)
         
-        # batch_first=True 설정 시 (batch, seq, feature) 순서
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=128, nhead=8, dim_feedforward=512, 
             dropout=0.1, batch_first=True, activation='gelu'
@@ -94,7 +100,7 @@ class StockTransformer(nn.Module):
 
 # ============================== [3] 메인 실행부 ==============================
 if __name__ == "__main__":
-    CSV_PATH = DATA_DIR / "total_top10_train_data.csv" # final_merge.py가 만든 파일명으로 확인 필요
+    CSV_PATH = DATA_DIR / "total_top10_train_data.csv"
     SEQ_LEN = 60
     PRED_HORIZON = [1, 3, 5]
     
@@ -102,10 +108,10 @@ if __name__ == "__main__":
     loader = DataLoader(ds, batch_size=64, shuffle=True)
     
     model = StockTransformer(ds.X.shape[2], seq_len=SEQ_LEN).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4) # lr 살짝 낮춤
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
     criterion = nn.MSELoss()
     
-    print(f"🚀 학습 시작... (장치: {DEVICE})")
+    print(f"🚀 학습 시작... (에포크: 200)")
     model.train()
     for epoch in range(200):
         total_loss = 0
@@ -121,7 +127,6 @@ if __name__ == "__main__":
                 break
                 
             loss.backward()
-            # Gradient Clipping 추가 (안정성 강화)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
@@ -136,7 +141,6 @@ if __name__ == "__main__":
         target_df = ds.raw_df[ds.raw_df['stk_cd'] == TARGET_CODE]
         if not target_df.empty:
             feature_cols = [c for c in target_df.columns if c not in ['dt', 'stk_cd']]
-            # 전체 스케일러 적용 필요
             last_raw = target_df[feature_cols].values[-SEQ_LEN:]
             last_seq = ds.full_scaler.transform(last_raw).astype(np.float32)
             last_seq_tensor = torch.from_numpy(last_seq).unsqueeze(0).to(DEVICE)
@@ -150,13 +154,12 @@ if __name__ == "__main__":
                 print(f"  ▶️ {h}일 후 예상 종가: {future_prices[0, i]:,.0f} 원")
             print("="*55 + "\n")
 
-    # 시각화 및 저장
+    # 시각화 데이터 추출
     with torch.no_grad():
         X_test = torch.from_numpy(ds.X[-300:]).to(DEVICE)
         pred_scaled = model(X_test).cpu().numpy()
         actual_scaled = ds.y[-300:]
         
-        # 역정규화 (가격 단위 복원)
         pred_final = ds.price_scaler.inverse_transform(pred_scaled)
         actual_final = ds.price_scaler.inverse_transform(actual_scaled)
 
@@ -169,8 +172,11 @@ if __name__ == "__main__":
 
     plt.tight_layout()
     plt.savefig(DATA_DIR / 'final_prediction_plot.png')
+    
+    # 모델 및 스케일러 저장
     torch.save(model.state_dict(), DATA_DIR / "transformer_model.pth")
     joblib.dump(ds.full_scaler, DATA_DIR / "full_scaler.pkl")
     joblib.dump(ds.price_scaler, DATA_DIR / "price_scaler.pkl")
     print(f"💾 결과 저장 완료 (위치: {DATA_DIR})")
+    
     plt.show()
