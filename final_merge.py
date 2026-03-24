@@ -2,76 +2,100 @@ import pandas as pd
 import numpy as np
 import os
 from sklearn.preprocessing import MinMaxScaler
+from pathlib import Path
 
-def create_final_train_data(stock_code):
-    print(f"🔄 {stock_code} 3대 요소 최종 병합 및 정규화 시작...")
-    
-    # 1. 파일 로드
-    price_file = f"{stock_code}_price.csv"
-    energy_file = f"{stock_code}_energy.csv"
-    fund_file = f"{stock_code}_fundamental.csv"
-    
-    if not all(os.path.exists(f) for f in [price_file, energy_file, fund_file]):
-        print("🚨 필수 CSV 파일이 누락되었습니다. 수집 상태를 확인하세요.")
-        return
+# ============================== [0] 경로 설정 (상대 경로 방식) ==============================
+# 현재 파일의 위치를 기준으로 프로젝트 루트와 csv 폴더를 잡습니다.
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "csv"
 
-    df_price = pd.read_csv(price_file)
-    df_energy = pd.read_csv(energy_file)
-    df_fund = pd.read_csv(fund_file)
+# 데이터 저장을 위한 폴더 확인
+if not DATA_DIR.exists():
+    os.makedirs(DATA_DIR)
+
+TOP_10_STOCKS = ["005930", "000660", "373220", "207940", "005380", "000270", "068270", "005490", "105560", "035420"]
+
+def process_single_stock(stock_code):
+    # 파일 경로 설정 (Path 객체 활용)
+    p = DATA_DIR / f"{stock_code}_price.csv"
+    e = DATA_DIR / f"{stock_code}_energy.csv"
+    f = DATA_DIR / f"{stock_code}_fundamental.csv"
     
-    # 2. 날짜 형식 통일 (YYYYMMDD 문자열로 통일)
-    df_price['dt'] = pd.to_datetime(df_price['dt']).dt.strftime('%Y%m%d')
-    df_energy['dt'] = df_energy['dt'].astype(str)
+    # 파일 존재 여부 확인
+    if not all(x.exists() for x in [p, e, f]):
+        print(f"⚠️ {stock_code}: 데이터 파일이 부족하여 건너뜜 (Price: {p.exists()}, Energy: {e.exists()}, Fund: {f.exists()})")
+        return None
     
-    # 3. [보강] 시계열 지표 재계산 (과거->미래 정렬 필수)
-    df_price = df_price.sort_values('dt').reset_index(drop=True)
-    if 'log_return' not in df_price.columns:
-        df_price['log_return'] = np.log(df_price['close'] / df_price['close'].shift(1))
+    # 데이터 로드
+    df_p = pd.read_csv(p)
+    df_e = pd.read_csv(e)
+    df_f = pd.read_csv(f)
     
-    df_price['ma5_return'] = df_price['log_return'].rolling(window=5).mean()
-    df_price['ma20_return'] = df_price['log_return'].rolling(window=20).mean()
+    # 날짜 형식 통일 (병합을 위해 문자열 포맷 일치)
+    df_p['dt'] = pd.to_datetime(df_p['dt']).dt.strftime('%Y%m%d')
+    df_e['dt'] = df_e['dt'].astype(str)
     
-    # 4. 시계열 데이터 병합 (Price + Energy)
-    final_df = pd.merge(df_price, df_energy, on='dt', how='inner')
+    # 종목 코드 포맷 통일 (000660 형태)
+    df_p['stk_cd'] = df_p['stk_cd'].astype(str).str.zfill(6)
+    df_e['stk_cd'] = df_e['stk_cd'].astype(str).str.zfill(6)
     
-    # 5. 가치(Fundamental) 데이터 결합
-    # 시계열이 아닌 정적 피처는 병합 후 모든 행에 동일하게 복사됩니다.
+    # 이동평균 피처 생성 (기술적 지표 추가)
+    df_p = df_p.sort_values('dt').reset_index(drop=True)
+    df_p['ma5_return'] = df_p['log_return'].rolling(5).mean()
+    df_p['ma20_return'] = df_p['log_return'].rolling(20).mean()
+    
+    # [Price + Energy] 내부 병합 (날짜와 종목코드가 모두 있는 데이터만 남김)
+    final_df = pd.merge(df_p, df_e, on=['dt', 'stk_cd'], how='inner')
+    
+    # [Fundamental] 재무 데이터 병합 (모든 행에 해당 종목의 재무 수치 할당)
     fund_cols = ['per', 'pbr', 'roe', 'eps_log', 'bps_log', 'cap_log']
     for col in fund_cols:
-        if col in df_fund.columns:
-            final_df[col] = df_fund[col].iloc[0]
-    
-    # 6. 피처 그룹 분리 (중요!)
-    # 매일 값이 변하여 0~1 스케일링이 필요한 항목
-    scaling_features = [
-        'log_return', 'volume_log', 'ma5_return', 'ma20_return',
-        'frgn_net_qty', 'frgn_net_diff', 'frgn_ma5', 'frgn_ma20',
-        'orgn_net_qty', 'orgn_net_diff', 'orgn_ma5', 'orgn_ma20'
+        if col in df_f.columns:
+            # 첫 번째 행의 값을 모든 행에 복사 (재무 데이터는 시계열이 아니므로)
+            final_df[col] = df_f[col].iloc[0]
+            
+    # 정규화 대상 피처 (입력값의 범위를 0~1 사이로 맞춤)
+    scaling_cols = [
+        'log_return', 'volume_log', 'ma5_return', 'ma20_return', 
+        'frgn_net_qty', 'orgn_net_qty'
     ]
     
-    # 단일 종목에서 값이 변하지 않아 스케일링하면 0이 되어버리는 항목 (그대로 유지)
-    static_features = [col for col in fund_cols if col in final_df.columns]
+    # 결측치(이동평균 계산 시 발생하는 NaN 등) 제거
+    final_df = final_df.dropna(subset=scaling_cols).reset_index(drop=True)
     
-    # 결측치 제거 (이동평균 등으로 발생한 NaN 행 삭제)
-    final_df = final_df.dropna(subset=scaling_features).reset_index(drop=True)
+    if len(final_df) > 0:
+        scaler = MinMaxScaler()
+        # 데이터가 0인 경우를 대비해 replace(inf, 0) 처리 추가 가능
+        final_df[scaling_cols] = scaler.fit_transform(final_df[scaling_cols])
+        return final_df
+    return None
+
+def merge_all_stocks():
+    all_dfs = []
+    print(f"🔄 {DATA_DIR} 폴더 내 데이터 병합 시작...")
     
-    # 7. 시계열 데이터만 정규화 (MinMax Scaling)
-    scaler = MinMaxScaler()
-    final_df[scaling_features] = scaler.fit_transform(final_df[scaling_features])
+    for code in TOP_10_STOCKS:
+        res = process_single_stock(code)
+        if res is not None:
+            all_dfs.append(res)
+            print(f"✅ {code} 병합 성공 ({len(res)}행)")
     
-    # 8. M1 맥북 GPU(MPS) 최적화: 모든 수치를 float32로 변환
-    all_numeric_cols = scaling_features + static_features
-    final_df[all_numeric_cols] = final_df[all_numeric_cols].astype('float32')
-    
-    # 최종 결과물 저장
-    output_file = f"{stock_code}_final_train.csv"
-    final_df.to_csv(output_file, index=False)
-    
-    print("-" * 30)
-    print(f"✅ 최종 학습 데이터 생성 완료: {output_file}")
-    print(f"📊 데이터 형상: {final_df.shape}")
-    print(f"📌 재무 데이터 보존 확인 (PER): {final_df['per'].iloc[0]}")
-    print(f"💡 모델 학습 준비 완료 (총 {len(all_numeric_cols)}개 피처)")
+    if all_dfs:
+        total_df = pd.concat(all_dfs, ignore_index=True)
+        
+        # 수치형 데이터 float32 변환 (메모리 절약 및 MPS 가속 최적화)
+        num_cols = total_df.columns.difference(['dt', 'stk_cd'])
+        total_df[num_cols] = total_df[num_cols].astype('float32')
+        
+        # 최종 결과 저장
+        output_path = DATA_DIR / "total_top10_train_data.csv"
+        total_df.to_csv(output_path, index=False)
+        
+        print("-" * 40)
+        print(f"🎉 통합 완료! 파일 저장 경로: {output_path}")
+        print(f"📊 총 데이터 수: {len(total_df)}행")
+    else:
+        print("🚨 병합할 수 있는 데이터가 없습니다. price.py, energy.py 등을 먼저 실행하세요.")
 
 if __name__ == "__main__":
-    create_final_train_data("000660")
+    merge_all_stocks()
