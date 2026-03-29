@@ -1,0 +1,7 @@
+version: '3.8'
+services:
+  stock-model:
+    build: .
+    volumes:
+      - .:/app
+    command: python -u transformer.py
