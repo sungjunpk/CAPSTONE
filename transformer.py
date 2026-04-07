@@ -2,181 +2,230 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-import joblib
-import os
 from pathlib import Path
 
-# ============================== [0] 경로 및 장치 설정 ==============================
+# =========================
+# 경로 & 디바이스
+# =========================
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "csv"
+DATA_DIR.mkdir(exist_ok=True)
 
-# 장치 설정 (MPS, CUDA, CPU 순서로 자동 감지)
-if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-elif torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-else:
-    DEVICE = torch.device("cpu")
-
+DEVICE = torch.device("mps" if torch.backends.mps.is_available() 
+                     else "cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 현재 사용 중인 연산 장치: {DEVICE}")
 
-if not DATA_DIR.exists():
-    os.makedirs(DATA_DIR)
+# =========================
+# Positional Encoding
+# =========================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 1000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
 
-# ============================== [1] 데이터셋 클래스 ==============================
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+# =========================
+# Dataset
+# =========================
 class StockDataset(Dataset):
-    def __init__(self, csv_path, seq_len=60, pred_horizon=[1, 3, 5]):
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {csv_path}")
-            
+    def __init__(self, csv_path, seq_len=90, pred_horizon=[1, 3, 5], 
+                 train=True, train_ratio=0.8, scalers=None):
         df = pd.read_csv(csv_path)
         df['stk_cd'] = df['stk_cd'].astype(str).str.zfill(6)
-        
-        # 0. 데이터 클렌징 (NaN/Inf 제거)
         df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
-        self.raw_df = df.copy()
         
-        # 1. 피처와 타겟 분리
-        feature_df = df.drop(columns=['dt', 'stk_cd'])
-        target_idx = feature_df.columns.get_loc('close')
-        
-        # 2. 전체 피처 스케일링
-        self.full_scaler = StandardScaler()
-        scaled_data = self.full_scaler.fit_transform(feature_df)
-        
-        # 별도의 가격 역산용 스케일러 저장
-        self.price_scaler = StandardScaler()
-        self.price_scaler.fit(feature_df.values[:, target_idx].reshape(-1, 1))
+        drop_cols = ['dt', 'stk_cd', 'stk_name']
+        self.feature_cols = [c for c in df.columns if c not in drop_cols]
         
         self.X, self.y = [], []
         max_h = max(pred_horizon)
+        self.scalers = scalers if scalers is not None else {}
         
-        # 종목별 시퀀스 생성
         for code in df['stk_cd'].unique():
             mask = (df['stk_cd'] == code).values
-            stock_data = scaled_data[mask]
+            stock_data = df[self.feature_cols].values[mask]
             
-            if len(stock_data) < (seq_len + max_h): continue
+            if len(stock_data) < seq_len + max_h + 30:
+                continue
+                
+            split_idx = int(len(stock_data) * train_ratio)
+            data = stock_data[:split_idx] if train else stock_data[split_idx:]
             
-            for i in range(len(stock_data) - seq_len - max_h + 1):
-                self.X.append(stock_data[i : i + seq_len])
-                targets = [stock_data[i + seq_len + h - 1, target_idx] for h in pred_horizon]
+            if train:
+                scaler = StandardScaler()
+                scaled_data = scaler.fit_transform(data)
+                self.scalers[code] = scaler
+            else:
+                if code not in self.scalers:
+                    continue
+                scaled_data = self.scalers[code].transform(data)
+            
+            # Target: log return
+            price_idx = self.feature_cols.index('close')
+            prices = stock_data[:, price_idx]
+            log_returns = np.log(prices / np.roll(prices, 1))
+            log_returns[0] = 0.0
+            
+            for i in range(len(data) - seq_len - max_h + 1):
+                self.X.append(scaled_data[i:i + seq_len])
+                targets = [log_returns[i + seq_len + h - 1] for h in pred_horizon]
                 self.y.append(targets)
         
-        self.X = np.array(self.X).astype(np.float32)
-        self.y = np.array(self.y).astype(np.float32)
-        print(f"✅ 데이터셋 생성 완료: {len(self.X)} 샘플 | 피처 수: {feature_df.shape[1]}")
+        self.X = np.array(self.X, dtype=np.float32)
+        self.y = np.array(self.y, dtype=np.float32)
+        
+        mode = "Train" if train else "Validation"
+        print(f"✅ {mode} 데이터셋: {len(self.X):,} 샘플 | seq_len={seq_len} | 피처: {len(self.feature_cols)}개")
 
-    def __len__(self): return len(self.X)
-    def __getitem__(self, idx): 
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
         return torch.from_numpy(self.X[idx]), torch.from_numpy(self.y[idx])
 
-# ============================== [2] Transformer 모델 ==============================
+# =========================
+# Transformer 모델
+# =========================
 class StockTransformer(nn.Module):
-    def __init__(self, feature_dim, seq_len=60, num_predictions=3):
+    def __init__(self, feature_dim: int, seq_len: int = 90, num_predictions: int = 3):
         super().__init__()
-        self.input_proj = nn.Linear(feature_dim, 128)
-        self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, 128) * 0.01)
+        d_model = 80          # overfitting 줄이기 위해 더 낮춤
+        nhead = 8
+        num_layers = 3        # 4 → 3으로 더 가볍게
+        
+        self.input_proj = nn.Linear(feature_dim, d_model)
+        self.pos_encoding = PositionalEncoding(d_model, max_len=seq_len + 150)
         
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=128, nhead=8, dim_feedforward=512, 
-            dropout=0.1, batch_first=True, activation='gelu'
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=192,
+            dropout=0.3,            # dropout 강화
+            activation='gelu',
+            batch_first=True, 
+            norm_first=True
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
         self.fc = nn.Sequential(
-            nn.Linear(128, 64),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 64),
             nn.GELU(),
+            nn.Dropout(0.25),
             nn.Linear(64, num_predictions)
         )
-        
+
     def forward(self, x):
-        x = self.input_proj(x) + self.pos_encoding
+        x = self.input_proj(x)
+        x = self.pos_encoding(x)
         x = self.encoder(x)
-        x = x.mean(dim=1) 
+        x = x[:, -1, :]
         return self.fc(x)
 
-# ============================== [3] 메인 실행부 ==============================
+# =========================
+# Loss
+# =========================
+class HuberLoss(nn.Module):
+    def __init__(self, delta=0.5):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, pred, target):
+        return nn.HuberLoss(delta=self.delta)(pred, target)
+
+# =========================
+# 메인
+# =========================
 if __name__ == "__main__":
-    CSV_PATH = DATA_DIR / "total_top10_train_data.csv"
-    SEQ_LEN = 60
+    CSV_PATH = DATA_DIR / "capstone_semiconductor_train_data_fixed.csv"
+    
+    SEQ_LEN = 90                    # ← 60 → 90으로 증가 (추천)
     PRED_HORIZON = [1, 3, 5]
+    BATCH_SIZE = 64
+    PATIENCE = 10
+    MAX_EPOCHS = 150
     
-    ds = StockDataset(CSV_PATH, seq_len=SEQ_LEN, pred_horizon=PRED_HORIZON)
-    loader = DataLoader(ds, batch_size=64, shuffle=True)
+    # Train / Validation Dataset
+    train_ds = StockDataset(
+        CSV_PATH, seq_len=SEQ_LEN, pred_horizon=PRED_HORIZON, 
+        train=True, train_ratio=0.8
+    )
     
-    model = StockTransformer(ds.X.shape[2], seq_len=SEQ_LEN).to(DEVICE)
+    val_ds = StockDataset(
+        CSV_PATH, seq_len=SEQ_LEN, pred_horizon=PRED_HORIZON, 
+        train=False, train_ratio=0.8, scalers=train_ds.scalers
+    )
+    
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+    
+    model = StockTransformer(
+        feature_dim=train_ds.X.shape[2],
+        seq_len=SEQ_LEN,
+        num_predictions=len(PRED_HORIZON)
+    ).to(DEVICE)
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
-    criterion = nn.MSELoss()
+    criterion = HuberLoss(delta=0.5)
     
-    print(f"🚀 학습 시작... (에포크: 200)")
-    model.train()
-    for epoch in range(200):
-        total_loss = 0
-        for xb, yb in loader:
+    # verbose 제거 (PyTorch 최신 버전)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+    
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_path = DATA_DIR / "best_transformer_v2.pth"
+    
+    print("\n🚀 Transformer 학습 시작...\n")
+    
+    for epoch in range(MAX_EPOCHS):
+        model.train()
+        train_loss = 0.0
+        for xb, yb in train_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            
             optimizer.zero_grad()
             pred = model(xb)
             loss = criterion(pred, yb)
-            
-            if torch.isnan(loss):
-                print("⚠️ Loss가 NaN입니다. 학습을 중단합니다.")
-                break
-                
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            total_loss += loss.item()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
         
-        if (epoch+1) % 10 == 0:
-            print(f"Epoch {epoch+1:3d} | Loss: {total_loss/len(loader):.6f}")
-
-    # ============================== [4] 예측 및 시각화 ==============================
-    TARGET_CODE = "000660" 
-    model.eval()
-    with torch.no_grad():
-        target_df = ds.raw_df[ds.raw_df['stk_cd'] == TARGET_CODE]
-        if not target_df.empty:
-            feature_cols = [c for c in target_df.columns if c not in ['dt', 'stk_cd']]
-            last_raw = target_df[feature_cols].values[-SEQ_LEN:]
-            last_seq = ds.full_scaler.transform(last_raw).astype(np.float32)
-            last_seq_tensor = torch.from_numpy(last_seq).unsqueeze(0).to(DEVICE)
-            
-            future_scaled = model(last_seq_tensor)
-            future_prices = ds.price_scaler.inverse_transform(future_scaled.cpu().numpy())
-            
-            print("\n" + "="*55)
-            print(f"🔮 종목코드 [{TARGET_CODE}] 미래 주가 예측 결과")
-            for i, h in enumerate(PRED_HORIZON):
-                print(f"  ▶️ {h}일 후 예상 종가: {future_prices[0, i]:,.0f} 원")
-            print("="*55 + "\n")
-
-    # 시각화 데이터 추출
-    with torch.no_grad():
-        X_test = torch.from_numpy(ds.X[-300:]).to(DEVICE)
-        pred_scaled = model(X_test).cpu().numpy()
-        actual_scaled = ds.y[-300:]
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                pred = model(xb)
+                val_loss += criterion(pred, yb).item()
+        val_loss /= len(val_loader)
         
-        pred_final = ds.price_scaler.inverse_transform(pred_scaled)
-        actual_final = ds.price_scaler.inverse_transform(actual_scaled)
-
-    fig, axes = plt.subplots(3, 1, figsize=(12, 12))
-    for i, h in enumerate(PRED_HORIZON):
-        axes[i].plot(actual_final[:, i], label='Actual', color='blue', alpha=0.6)
-        axes[i].plot(pred_final[:, i], label='Predicted', color='red', linestyle='--')
-        axes[i].set_title(f"Forecast: +{h} Day(s)")
-        axes[i].legend()
-
-    plt.tight_layout()
-    plt.savefig(DATA_DIR / 'final_prediction_plot.png')
+        scheduler.step(val_loss)
+        
+        print(f"Epoch {epoch+1:3d} | Train: {train_loss:.6f} | Val: {val_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), best_model_path)
+            print(f"   → Best Model Saved! (Val Loss: {best_val_loss:.6f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print("🛑 Early Stopping")
+                break
     
-    # 모델 및 스케일러 저장
-    torch.save(model.state_dict(), DATA_DIR / "transformer_model.pth")
-    joblib.dump(ds.full_scaler, DATA_DIR / "full_scaler.pkl")
-    joblib.dump(ds.price_scaler, DATA_DIR / "price_scaler.pkl")
-    print(f"💾 결과 저장 완료 (위치: {DATA_DIR})")
-    
-    plt.show()
+    print(f"\n🎉 학습 완료! Best Val Loss: {best_val_loss:.6f}")
+    print(f"💾 Best 모델 저장: {best_model_path}")
